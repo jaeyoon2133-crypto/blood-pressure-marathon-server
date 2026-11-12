@@ -787,8 +787,7 @@ function doAttack(){
   if(onlineMode){
     if(player.attackCd>0||player.dead||(player.frozen>0&&player.id!==4))return;
     player.attackCd=.34;chars[player.id].atkAnim=.28;
-    if(player.id===6)chars[player.id].shieldBash=.72;
-    netSend({type:'action',action:'attack',yaw,pitch});
+    netSend({type:'action',action:'attack',yaw});
     return;
   }
   if(player.attackCd>0||(player.frozen>0&&player.id!==4))return;
@@ -901,8 +900,8 @@ function doSkill(){
     const cfg=CHAR_CFG[player.id];
     if(!cfg.skill||player.dead||player.skillCd>0||(player.frozen>0&&player.id!==4))return;
     if(player.id===1||player.id===4)return;
-    netSend({type:'action',action:'skill',yaw,pitch});
-    chars[player.id].atkAnim=.4;if(player.id===6)chars[player.id].shieldBash=.72;
+    netSend({type:'action',action:'skill',yaw});
+    chars[player.id].atkAnim=.4;
     if(player.id===3)toast('🏗️ 서버에 포탑 설치 요청!');
     else if(player.id===6)toast('🛡️ 방패 밀치기!');
     else if(player.id===2)toast('🧊 빙결 수류탄!');
@@ -1083,7 +1082,6 @@ function launchRace(){
 // ===== ONLINE MULTIPLAYER BRIDGE (WebSocket authoritative room server) =====
 let onlineMode=false, netSocket=null, netRoomId='', netPlayerId='', netSnapshot=null;
 let netReqSeq=0, netPending=new Map(), netEntities=new Map(), netTurretVisuals=new Map();
-let netAttackVisuals=[], netGrenadeVisuals=[];
 let netInputClock=0, netJumpQueued=false, netServerEventsSeen=0;
 let netLastSentInputKey='', netLastInputSendAt=0;
 function netInterpolationDelayMs(){const ping=Number.isFinite(netPingMs)?netPingMs:100;return Math.max(125,Math.min(300,105+ping*.45+netPingJitterMs*2));}
@@ -1284,7 +1282,7 @@ async function netLeaveRoom(){
 }
 function startOnlineRace(s){
   if(!s)return;
-  onlineMode=true;started=true;netSelfInitialized=false;netCorrectionX=netCorrectionDist=0;netAttackVisuals.forEach(v=>scene.remove(v.mesh));netAttackVisuals=[];netGrenadeVisuals.forEach(v=>scene.remove(v.mesh));netGrenadeVisuals=[];netInputClock=0;netLastSentInputKey='';netLastInputSendAt=0;
+  onlineMode=true;started=true;netSelfInitialized=false;netCorrectionX=netCorrectionDist=0;netInputClock=0;netLastSentInputKey='';netLastInputSendAt=0;
   document.getElementById('start').style.display='none';document.getElementById('roomPanel').style.display='none';
   document.getElementById('hud').style.display='block';
   if('ontouchstart' in window||innerWidth<700)document.getElementById('mobile').style.display='block';
@@ -1391,55 +1389,29 @@ function applyNetSnapshot(s){
   if(onlineMode)updateHUD();
 }
 
-function spawnNetAttackVisual(e){
-  const mesh=new T.Group(),id=e.charId;
-  let color=0xffffff,speed=42;
-  if(id===0){color=0xff6eb4;mesh.add(new T.Mesh(new T.SphereGeometry(.22,12,12),mat(color,.2,0,color)));mesh.add(new T.Mesh(new T.OctahedronGeometry(.26),mat(0xffb3d9,.2,0,color)));}
-  else if(id===1){color=0x88e882;mesh.add(new T.Mesh(new T.DodecahedronGeometry(.25),mat(color,.3,0,color)));}
-  else if(id===2){color=0x7ce4ff;const c=new T.Mesh(new T.OctahedronGeometry(.26),mat(color,.15,.2,color));c.scale.set(1,1,1.6);mesh.add(c);}
-  else if(id===3){color=0xffc84f;speed=48;const b=new T.Mesh(new T.CylinderGeometry(.14,.14,.45,6),mat(color,.3,.5,0xffaa00));b.rotation.x=Math.PI/2;mesh.add(b);}
-  else if(id===4){color=0xa8ecff;speed=36;mesh.add(new T.Mesh(new T.SphereGeometry(.28,16,16),mat(color,.05,.1,0x66ccff)));}
-  else if(id===5){color=0xc68aff;speed=45;mesh.add(new T.Mesh(new T.OctahedronGeometry(.28),mat(color,.2,.3,0x9944ff)));}
-  mesh.position.set(e.x,e.y||1.35,-e.dist);scene.add(mesh);
-  netAttackVisuals.push({mesh,vel:new T.Vector3(e.vx,0,-e.vDist),life:e.timer||1.5});
-}
 function handleNetGameEvent(e){
   const target=netEntities.get(e.targetId);
   if(e.event==='death'){if(e.targetId===netPlayerId)toast('💀 사망! 3초 후 출발선에서 부활합니다.');else if(target)spawnParticles(new T.Vector3(target.data.x,1,-target.data.dist),0xff5577,18,7)}
   else if(e.event==='respawn'){toast(e.targetId===netPlayerId?'✨ 출발선에서 부활했습니다!':'✨ 경쟁자가 출발선에서 부활했습니다!')}
-  else if(e.event==='lap'&&e.targetId===netPlayerId){if(Number.isInteger(e.charId)){player.id=e.charId;player.max=e.maxHp||stats[e.charId].hp;player.hp=player.max;player.skillCd=0;updateHUD();updateSkillUI()}toast(`🏁 ${e.lap}랩! 새로운 랜덤 캐릭터!`)}
+  else if(e.event==='lap'&&e.targetId===netPlayerId)toast(`🏁 ${e.lap}랩! 새로운 랜덤 캐릭터!`);
   else if(e.event==='finish')toast(`🏆 ${e.nick||'플레이어'} 완주!`);
   else if(e.event==='notice'&&e.targetId===netPlayerId)toast(e.message||'알림');
-  else if(e.event==='attack-projectile'){
-    const owner=netEntities.get(e.ownerId);if(owner){owner.obj.atkAnim=.28;if(e.charId===6)owner.obj.shieldBash=.72;}
-    spawnNetAttackVisual(e);
-  }
-  else if(e.event==='bash'){const attacker=netEntities.get(e.ownerId);if(attacker){attacker.obj.atkAnim=.4;attacker.obj.shieldBash=.72;}if(e.ownerId===netPlayerId){chars[player.id].atkAnim=.4;chars[player.id].shieldBash=.72;}spawnParticles(new T.Vector3(e.x||player.x,1.1,-(e.dist||player.dist)),0x5b86e5,16,6)}
+  else if(e.event==='bash'){spawnParticles(new T.Vector3(e.x||player.x,1.1,-(e.dist||player.dist)),0x5b86e5,16,6)}
   else if(e.event==='ice-throw'){
     const gMesh=new T.Group();
     gMesh.add(new T.Mesh(new T.OctahedronGeometry(.28),mat(0x66d9ff,.15,.2,0x22bbff)));
     gMesh.add(new T.Mesh(new T.TorusGeometry(.24,.05,8,16),mat(0xffffff,.2,0,0x88eeff)));
     gMesh.position.set(e.x,e.y,-e.dist);scene.add(gMesh);
-    netGrenadeVisuals.push({id:e.id,mesh:gMesh,vel:new T.Vector3(e.vx,e.vy,-e.vDist),timer:e.timer||1.3});
+    grenades.push({mesh:gMesh,vel:new T.Vector3(e.vx,e.vy,-e.vDist),timer:e.timer||1.45,networked:true});
   }
-  else if(e.event==='ice-land'){
-    const g=netGrenadeVisuals.find(v=>v.id===e.projectileId);if(g){scene.remove(g.mesh);netGrenadeVisuals=netGrenadeVisuals.filter(v=>v!==g)}
-    createIceZone(new T.Vector3(e.x,0,-e.dist));
-  }
-  else if(e.event==='ice'){spawnParticles(new T.Vector3(e.x,0.4,-e.dist),0x88eeff,24,7)}
+  else if(e.event==='ice'){createIceZone(new T.Vector3(e.x,0,-e.dist));spawnParticles(new T.Vector3(e.x,0.4,-e.dist),0x88eeff,24,7)}
   else if(e.event==='rage'){spawnParticles(new T.Vector3(e.x,0.3,-e.dist),0xff6eb4,24,7)}
   else if(e.event==='royal'){spawnParticles(new T.Vector3(e.x,0.4,-e.dist),0xc68aff,18,6)}
-  else if(e.event==='hit'){spawnParticles(new T.Vector3(e.x,1.1,-e.dist),0xffd36e,10,5)}
   else if(e.event==='turret-place')toast('🏗️ 포탑 설치!');
-  else if(e.event==='turret-destroy')spawnParticles(new T.Vector3(e.x,.7,-e.dist),0xffa83d,22,7);
-  else if(e.event==='turret-shot')spawnParticles(new T.Vector3(e.x||player.x,1.1,-(e.dist||player.dist)),0xffaa22,5,3);
+  else if(e.event==='turret-shot'&&target)spawnParticles(new T.Vector3(target.data.x,1.1,-target.data.dist),0xffaa22,5,3);
   else if(e.event==='shot')spawnParticles(new T.Vector3(e.x||player.x,1.3,-(e.dist||player.dist)),0xffd36e,4,2);
 }
-
 function updateOnline(dt){
-  for(let i=netAttackVisuals.length-1;i>=0;i--){const v=netAttackVisuals[i];v.life-=dt;v.mesh.position.addScaledVector(v.vel,dt);v.mesh.rotation.z+=10*dt;v.mesh.rotation.y+=8*dt;if(v.life<=0){scene.remove(v.mesh);netAttackVisuals.splice(i,1)}}
-  for(let i=netGrenadeVisuals.length-1;i>=0;i--){const g=netGrenadeVisuals[i];g.timer-=dt;g.vel.y-=22*dt;g.mesh.position.addScaledVector(g.vel,dt);g.mesh.rotation.x+=12*dt;g.mesh.rotation.z+=9*dt;}
-  for(let i=iceZones.length-1;i>=0;i--){const z=iceZones[i];z.life-=dt;if(z.life<1)z.mesh.scale.setScalar(Math.max(.01,z.life));if(z.life<=0){scene.remove(z.mesh);iceZones.splice(i,1)}}
   let forward=(keys.w||keys.arrowup?1:0)-(keys.s||keys.arrowdown?1:0)-joy.y;
   let side=(keys.d||keys.arrowright?1:0)-(keys.a||keys.arrowleft?1:0)+joy.x;
   forward=Math.max(-1,Math.min(1,forward));side=Math.max(-1,Math.min(1,side));
