@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: blood-pressure-marathon-server
+    runtime: node
+    region: singapore
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
