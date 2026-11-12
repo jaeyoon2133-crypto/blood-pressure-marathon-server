@@ -2,6 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 
@@ -11,7 +12,9 @@ const GAME_FILE = path.join(ROOT, 'public', 'index.html');
 const PORT = Number(process.env.PORT || 2567);
 const MAX_PLAYERS = 8;
 const TRACK_LENGTH = 750;
-const TICK_MS = 50;
+const MAX_LAPS = 10;
+const SIM_TICK_MS = 1000 / 30;
+const SNAPSHOT_INTERVAL_MS = 50; // 20Hz snapshots; client interpolates between them
 const STATS = [
   { hp: 50, speed: 12, damage: 12 },
   { hp: 200, speed: 8.6, damage: 18 },
@@ -24,6 +27,8 @@ const STATS = [
 const SKILL_CD = [6, 0, 5, 0.5, 0, 0, 0];
 const rooms = new Map();
 const socketPlayers = new Map();
+const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
+eventLoopDelay.enable();
 
 const randomChar = () => Math.floor(Math.random() * STATS.length);
 const randomId = (n = 6) => crypto.randomBytes(8).toString('base64url').slice(0, n).toUpperCase();
@@ -44,7 +49,7 @@ function json(res, status, body) {
 const server = http.createServer((req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   if (req.method === 'OPTIONS') return json(res, 204, {});
-  if (url.pathname === '/health') return json(res, 200, { ok: true, game: 'blood-pressure-marathon', players: [...rooms.values()].reduce((n, r) => n + r.players.size, 0), rooms: rooms.size });
+  if (url.pathname === '/health') return json(res, 200, { ok: true, game: 'blood-pressure-marathon', players: [...rooms.values()].reduce((n, r) => n + r.players.size, 0), rooms: rooms.size, uptimeSec: Math.round(process.uptime()), eventLoopDelayMs: { mean: Number((eventLoopDelay.mean / 1e6 || 0).toFixed(2)), p95: Number((eventLoopDelay.percentile(95) / 1e6 || 0).toFixed(2)), max: Number((eventLoopDelay.max / 1e6 || 0).toFixed(2)) } });
   if (url.pathname === '/api/rooms') return json(res, 200, { rooms: [...rooms.values()].filter(r => r.phase === 'waiting' && !r.closed).map(roomSummary) });
   if (url.pathname === '/' || url.pathname === '/index.html') {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
@@ -54,7 +59,7 @@ const server = http.createServer((req, res) => {
   json(res, 404, { error: 'Not found' });
 });
 
-const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 });
+const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024, perMessageDeflate: false });
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   if (url.pathname !== '/ws') { socket.destroy(); return; }
@@ -113,6 +118,7 @@ function snapshot(room, forPlayerId = '') {
   room.snapshotSeq = (room.snapshotSeq || 0) + 1;
   return {
     snapshotSeq: room.snapshotSeq,
+    serverTime: Date.now(),
     room: roomSummary(room),
     selfId: forPlayerId,
     phase: room.phase,
@@ -121,19 +127,28 @@ function snapshot(room, forPlayerId = '') {
       id: p.id, nick: p.nick, charId: p.charId, hp: p.hp, maxHp: p.maxHp,
       x: p.x, dist: p.dist, lap: p.lap, yaw: p.yaw, ready: p.ready, isHost: p.isHost,
       dead: p.dead, jumpHeight: p.jumpHeight, frozen: p.frozen, confused: p.confused,
-      stun: p.stun, pushTime: p.pushTime, skillCd: p.skillCd, finished: p.finished,
+      stun: p.stun, pushTime: p.pushTime, pushX: p.pushX, pushDist: p.pushDist,
+      pushSpeed: p.pushSpeed || 15, skillCd: p.skillCd, finished: p.finished,
     })),
     bots: room.bots.map(b => ({
       id: b.id, nick: b.nick, charId: b.charId, hp: b.hp, maxHp: b.maxHp,
       x: b.x, dist: b.dist, lap: b.lap, yaw: 0, dead: b.dead, jumpHeight: b.jumpHeight,
       frozen: b.frozen, confused: b.confused, stun: b.stun, pushTime: b.pushTime,
+      pushX: b.pushX, pushDist: b.pushDist, pushSpeed: b.pushSpeed || 15,
       skillCd: b.skillCd, finished: b.finished,
     })),
     turrets: room.turrets.map(t => ({ id: t.id, ownerId: t.ownerId, x: t.x, dist: t.dist, hp: t.hp, maxHp: t.maxHp })),
   };
 }
 function broadcastSnapshot(room) {
-  for (const p of room.players.values()) send(p.ws, { type: 'room:snapshot', snapshot: snapshot(room, p.id) });
+  // Build the room state once per broadcast instead of serializing a separate
+  // full entity map for every player. Clients identify themselves via netPlayerId.
+  const payload = JSON.stringify({ type: 'room:snapshot', snapshot: snapshot(room) });
+  for (const p of room.players.values()) {
+    if (p.ws && p.ws.readyState === WebSocket.OPEN && p.ws.bufferedAmount < 48 * 1024) {
+      p.ws.send(payload);
+    }
+  }
 }
 function startRace(room) {
   room.phase = 'racing';
@@ -289,10 +304,10 @@ function updateEntity(room, e, dt, isBot = false) {
   if (e.dead) {
     e.deathTimer -= dt;
     if (e.deathTimer <= 0) {
-      e.dead = false; e.deathTimer = 0; e.dist = 0; e.lap = 1; e.x = e.spawnX;
+      e.dead = false; e.deathTimer = 0; e.dist = 0; /* keep e.lap on death */ e.x = e.spawnX;
       e.hp = e.maxHp; e.frozen = e.confused = e.stun = e.pushTime = 0;
       e.pushX = e.pushDist = 0; e.jumpHeight = e.jumpTime = 0; e.finished = false;
-      emit(room, 'game:event', { event: 'respawn', targetId: e.id });
+      emit(room, 'game:event', { event: 'respawn', targetId: e.id, lap: e.lap });
     }
     return;
   }
@@ -329,7 +344,7 @@ function updateEntity(room, e, dt, isBot = false) {
   if (e.dist >= TRACK_LENGTH) {
     e.dist -= TRACK_LENGTH;
     e.lap++;
-    if (e.lap > 15) {
+    if (e.lap > MAX_LAPS) {
       e.finished = true;
       if (!room.winnerId && !isBot) room.winnerId = e.id;
       emit(room, 'game:event', { event: 'finish', targetId: e.id, nick: e.nick });
@@ -364,6 +379,10 @@ function updateTurrets(room, dt) {
 function handleMessage(ws, msg) {
   const requestId = msg.requestId;
   const entry = socketPlayers.get(ws);
+  if (msg.type === 'net:ping') {
+    send(ws, { type: 'net:pong', clientTime: Number(msg.clientTime) || 0, serverTime: Date.now() });
+    return;
+  }
   if (msg.type === 'room:heartbeat') return;
   if (msg.type === 'rooms:list') {
     return reply(ws, requestId, true, { rooms: [...rooms.values()].filter(r => r.phase === 'waiting' && !r.closed).map(roomSummary) });
@@ -454,6 +473,8 @@ function handleMessage(ws, msg) {
 }
 
 wss.on('connection', ws => {
+  // Disable Nagle buffering so small real-time input/ping packets are sent promptly.
+  ws._socket?.setNoDelay(true);
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
   ws.on('message', raw => {
@@ -470,10 +491,24 @@ wss.on('connection', ws => {
   send(ws, { type: 'server:hello', protocol: 1, maxPlayers: MAX_PLAYERS });
 });
 
+// Fixed-step 30Hz server simulation with independent 20Hz network snapshots.
+// This avoids tying game movement to Node timer jitter and limits catch-up work
+// after a brief event-loop stall.
+let lastLoopAt = performance.now();
+let simAccumulatorMs = 0;
+let snapshotAccumulatorMs = 0;
 setInterval(() => {
-  const dt = TICK_MS / 1000;
-  for (const room of rooms.values()) {
-    if (room.phase === 'racing') {
+  const now = performance.now();
+  const elapsedMs = Math.min(120, Math.max(0, now - lastLoopAt));
+  lastLoopAt = now;
+  simAccumulatorMs += elapsedMs;
+  snapshotAccumulatorMs += elapsedMs;
+
+  let steps = 0;
+  while (simAccumulatorMs >= SIM_TICK_MS && steps < 3) {
+    const dt = SIM_TICK_MS / 1000;
+    for (const room of rooms.values()) {
+      if (room.phase !== 'racing') continue;
       for (const p of room.players.values()) updateEntity(room, p, dt, false);
       for (const b of room.bots) updateEntity(room, b, dt, true);
       updateTurrets(room, dt);
@@ -482,10 +517,21 @@ setInterval(() => {
         room.phase = 'finished';
         emit(room, 'race:finished', { winnerId: room.winnerId });
       }
-      broadcastSnapshot(room);
+    }
+    simAccumulatorMs -= SIM_TICK_MS;
+    steps++;
+  }
+  // If the process is heavily stalled, discard excess backlog rather than
+  // sending a burst of obsolete updates that would worsen latency.
+  if (steps === 3 && simAccumulatorMs >= SIM_TICK_MS) simAccumulatorMs = 0;
+
+  if (snapshotAccumulatorMs >= SNAPSHOT_INTERVAL_MS) {
+    snapshotAccumulatorMs %= SNAPSHOT_INTERVAL_MS;
+    for (const room of rooms.values()) {
+      if (room.phase === 'racing') broadcastSnapshot(room);
     }
   }
-}, TICK_MS);
+}, 16);
 
 setInterval(() => {
   for (const ws of wss.clients) {

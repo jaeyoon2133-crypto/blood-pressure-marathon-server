@@ -4,7 +4,6 @@ services:
     runtime: node
     region: singapore
     plan: free
-    rootDir: blood
     buildCommand: npm install
     startCommand: npm start
     healthCheckPath: /health
