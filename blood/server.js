@@ -2,6 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 
@@ -26,6 +27,8 @@ const STATS = [
 const SKILL_CD = [6, 0, 5, 0.5, 0, 0, 0];
 const rooms = new Map();
 const socketPlayers = new Map();
+const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
+eventLoopDelay.enable();
 
 const randomChar = () => Math.floor(Math.random() * STATS.length);
 const randomId = (n = 6) => crypto.randomBytes(8).toString('base64url').slice(0, n).toUpperCase();
@@ -46,7 +49,7 @@ function json(res, status, body) {
 const server = http.createServer((req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   if (req.method === 'OPTIONS') return json(res, 204, {});
-  if (url.pathname === '/health') return json(res, 200, { ok: true, game: 'blood-pressure-marathon', players: [...rooms.values()].reduce((n, r) => n + r.players.size, 0), rooms: rooms.size });
+  if (url.pathname === '/health') return json(res, 200, { ok: true, game: 'blood-pressure-marathon', players: [...rooms.values()].reduce((n, r) => n + r.players.size, 0), rooms: rooms.size, uptimeSec: Math.round(process.uptime()), eventLoopDelayMs: { mean: Number((eventLoopDelay.mean / 1e6 || 0).toFixed(2)), p95: Number((eventLoopDelay.percentile(95) / 1e6 || 0).toFixed(2)), max: Number((eventLoopDelay.max / 1e6 || 0).toFixed(2)) } });
   if (url.pathname === '/api/rooms') return json(res, 200, { rooms: [...rooms.values()].filter(r => r.phase === 'waiting' && !r.closed).map(roomSummary) });
   if (url.pathname === '/' || url.pathname === '/index.html') {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
@@ -56,7 +59,7 @@ const server = http.createServer((req, res) => {
   json(res, 404, { error: 'Not found' });
 });
 
-const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 });
+const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024, perMessageDeflate: false });
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   if (url.pathname !== '/ws') { socket.destroy(); return; }
@@ -142,7 +145,7 @@ function broadcastSnapshot(room) {
   // full entity map for every player. Clients identify themselves via netPlayerId.
   const payload = JSON.stringify({ type: 'room:snapshot', snapshot: snapshot(room) });
   for (const p of room.players.values()) {
-    if (p.ws && p.ws.readyState === WebSocket.OPEN && p.ws.bufferedAmount < 96 * 1024) {
+    if (p.ws && p.ws.readyState === WebSocket.OPEN && p.ws.bufferedAmount < 48 * 1024) {
       p.ws.send(payload);
     }
   }
@@ -470,6 +473,8 @@ function handleMessage(ws, msg) {
 }
 
 wss.on('connection', ws => {
+  // Disable Nagle buffering so small real-time input/ping packets are sent promptly.
+  ws._socket?.setNoDelay(true);
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
   ws.on('message', raw => {
