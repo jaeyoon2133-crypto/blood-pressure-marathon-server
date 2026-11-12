@@ -14,7 +14,7 @@ const MAX_PLAYERS = 8;
 const TRACK_LENGTH = 480;
 const MAX_LAPS = 10;
 const SIM_TICK_MS = 1000 / 30;
-const SNAPSHOT_INTERVAL_MS = 50; // 20Hz snapshots; client interpolates between them
+const SNAPSHOT_INTERVAL_MS = SIM_TICK_MS; // 30Hz snapshots aligned with the 30Hz authoritative simulation
 const STATS = [
   { hp: 50, speed: 12, damage: 12 },
   { hp: 200, speed: 8.6, damage: 18 },
@@ -49,7 +49,7 @@ function json(res, status, body) {
 const server = http.createServer((req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   if (req.method === 'OPTIONS') return json(res, 204, {});
-  if (url.pathname === '/health') return json(res, 200, { ok: true, game: 'blood-pressure-marathon', players: [...rooms.values()].reduce((n, r) => n + r.players.size, 0), rooms: rooms.size, uptimeSec: Math.round(process.uptime()), eventLoopDelayMs: { mean: Number((eventLoopDelay.mean / 1e6 || 0).toFixed(2)), p95: Number((eventLoopDelay.percentile(95) / 1e6 || 0).toFixed(2)), max: Number((eventLoopDelay.max / 1e6 || 0).toFixed(2)) } });
+  if (url.pathname === '/health') return json(res, 200, { ok: true, game: 'blood-pressure-marathon', players: [...rooms.values()].reduce((n, r) => n + r.players.size, 0), rooms: rooms.size, uptimeSec: Math.round(process.uptime()), eventLoopDelayMs: { mean: Number((eventLoopDelay.mean / 1e6 || 0).toFixed(2)), p95: Number((eventLoopDelay.percentile(95) / 1e6 || 0).toFixed(2)), max: Number((eventLoopDelay.max / 1e6 || 0).toFixed(2)) }, simTickMs: SIM_TICK_MS, snapshotIntervalMs: SNAPSHOT_INTERVAL_MS, websocketClients: wss?.clients?.size || 0 });
   if (url.pathname === '/api/rooms') return json(res, 200, { rooms: [...rooms.values()].filter(r => r.phase === 'waiting' && !r.closed).map(roomSummary) });
   if (url.pathname === '/' || url.pathname === '/index.html') {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
@@ -145,7 +145,7 @@ function broadcastSnapshot(room) {
   // full entity map for every player. Clients identify themselves via netPlayerId.
   const payload = JSON.stringify({ type: 'room:snapshot', snapshot: snapshot(room) });
   for (const p of room.players.values()) {
-    if (p.ws && p.ws.readyState === WebSocket.OPEN && p.ws.bufferedAmount < 48 * 1024) {
+    if (p.ws && p.ws.readyState === WebSocket.OPEN && p.ws.bufferedAmount < 16 * 1024) {
       p.ws.send(payload);
     }
   }
@@ -381,7 +381,7 @@ function handleMessage(ws, msg) {
   const requestId = msg.requestId;
   const entry = socketPlayers.get(ws);
   if (msg.type === 'net:ping') {
-    send(ws, { type: 'net:pong', clientTime: Number(msg.clientTime) || 0, serverTime: Date.now() });
+    send(ws, { type: 'net:pong', clientTime: Number(msg.clientTime) || 0, serverTime: Date.now(), eventLoopP95Ms: Number((eventLoopDelay.percentile(95) / 1e6 || 0).toFixed(2)) });
     return;
   }
   if (msg.type === 'room:heartbeat') return;
