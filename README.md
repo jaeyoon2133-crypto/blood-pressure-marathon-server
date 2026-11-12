@@ -1,0 +1,39 @@
+# 혈압 마라톤 멀티플레이 수정본
+
+이 패키지는 원본 캐릭터 모델과 외형을 유지하면서 싱글플레이 전투 규칙에 맞춰 멀티플레이 전투 판정을 수정한 버전입니다.
+
+## 이번 수정
+
+- 기본 공격: 캐릭터별 원본 투사체 속도와 피해량, 조준 pitch/yaw 반영
+- 강타 캐릭터: 기본 공격은 피해량 22, 스킬은 피해량 8로 원본 규칙 분리, 방향 판정과 넉백/스턴 반영
+- 광분 스킬: 반경 16, 역방향 혼란 4초, 시민 캐릭터 면역
+- 얼음 스킬: 원본 중력/비행 시간/빙결 범위와 달리기 운동량 합성, 장판 4.5초 및 빙결 3초
+- 설비사: 최대 5개 포탑, 24m 내 적 플레이어 자동 공격, 탄환 피해량 7
+- 절대자: 20m 범위 스턴 2초, 쿨타임 없음
+- 시민: 피해와 상태이상 면역
+- 멀티플레이 클라이언트에서 공격 투사체, 얼음 수류탄, 빙결 장판 시각 효과 동기화
+- 캐릭터 모델/텍스처 생성 코드는 변경하지 않음
+
+## Render 배포
+
+1. 압축을 푼 뒤 폴더 안의 파일과 폴더를 GitHub 저장소 루트에 업로드합니다.
+2. Render에서 Blueprint로 `render.yaml`을 적용하거나 기존 `blood-pressure-marathon-server-9dc6` 서비스를 업데이트합니다.
+3. 리전은 `singapore`로 유지됩니다.
+4. 배포 후 `https://blood-pressure-marathon-server-9dc6.onrender.com/health`가 `ok:true`를 반환하는지 확인합니다.
+5. WebSocket 경로는 `wss://blood-pressure-marathon-server-9dc6.onrender.com/ws`입니다.
+
+## itch.io 배포
+
+`itch-client/index.html`을 HTML5 게임 파일로 업로드합니다. 단, Render 서버를 먼저 업데이트해야 새 전투 판정이 적용됩니다. HTML만 교체하고 서버를 업데이트하지 않으면 기존 서버 판정이 계속 사용됩니다.
+
+## 검증
+
+- 서버 JavaScript 문법 검사: 통과
+- 클라이언트 JavaScript 문법 검사: 통과
+- 실제 Render 배포 및 2인 온라인 브라우저 대전은 아직 수행하지 않았습니다.
+
+
+## Gameplay parity update
+- Race length: 10 laps (server and client match).
+- Track length: 336 units (30% shorter than 480; server and client match).
+- Character HP, movement speed, basic attack damage, projectile speed, and skill cooldowns are aligned to the original client data.
