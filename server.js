@@ -7,12 +7,18 @@ const PORT = Number(process.env.PORT || 3000);
 const TICK_HZ = 30;
 const SNAPSHOT_HZ = 15;
 const MAX_PLAYERS = 8;
-const TRACK_LENGTH = 480;
+const MAX_LAPS = 10;
+const TRACK_LENGTH = 336; // Match client: 30% shorter than 480
+// Authoritative stats copied from the original game's CHAR_CFG + stats.
+// projectileSpeed is the original client value (42) for ranged basic attacks.
 const CHAR = [
-  { hp:50, speed:12, damage:12 }, { hp:200, speed:8.6, damage:18 },
-  { hp:20, speed:11, damage:10 }, { hp:35, speed:14, damage:8 },
-  { hp:15, speed:12, damage:0 }, { hp:100, speed:13, damage:15 },
-  { hp:150, speed:10, damage:22 }
+  { hp:50,  speed:12,   damage:12, projectileSpeed:42, skillCd:6 },   // 광분
+  { hp:200, speed:8.6,  damage:18, projectileSpeed:42, skillCd:0 },   // 느림 (패시브)
+  { hp:20,  speed:11,   damage:10, projectileSpeed:42, skillCd:5 },   // 얼음
+  { hp:35,  speed:14,   damage:9,  projectileSpeed:42, skillCd:0.5 }, // 설비사
+  { hp:15,  speed:12,   damage:8,  projectileSpeed:42, skillCd:0 },   // 시민 (무적)
+  { hp:100, speed:13,   damage:16, projectileSpeed:42, skillCd:0 },   // 절대자
+  { hp:150, speed:10,   damage:22, projectileSpeed:42, skillCd:0 }    // 강타
 ];
 const rooms = new Map();
 const peers = new Map();
@@ -80,7 +86,7 @@ function listRooms(){
 function createRoom(peer,d){
  const roomId=roomCode();
  const room={id:roomId,name:safeName(d.name||'새로운 레이스 방'),password:String(d.password||'').slice(0,32),
-  phase:'waiting',players:new Map(),turrets:[],iceProjectiles:[],winnerId:null,createdAt:Date.now()};
+  phase:'waiting',players:new Map(),turrets:[],iceProjectiles:[],iceZones:[],projectiles:[],winnerId:null,createdAt:Date.now()};
  rooms.set(roomId,room);
  return enterRoom(peer,room,d.nick);
 }
@@ -96,58 +102,145 @@ function startRoom(room){
  const humans=aliveHumans(room);
  if(humans.length<2)throw Error('실제 참가자가 2명 이상이어야 합니다.');
  if(!humans.every(p=>p.ready))throw Error('모든 플레이어가 준비해야 합니다.');
- room.phase='racing';room.turrets=[];room.winnerId=null;
+ room.phase='racing';room.turrets=[];room.projectiles=[];room.iceProjectiles=[];room.iceZones=[];room.winnerId=null;
  humans.forEach((p,i)=>{p.x=(i-(humans.length-1)/2)*2;p.dist=0;p.lap=1;p.finished=false;p.dead=false;p.hp=p.maxHp;p.frozen=p.confused=p.stun=p.skillCd=0;p.jumpHeight=p.jumpVelocity=0;p.input={forward:0,side:0,yaw:0,pitch:0,jump:false};});
  broadcastRoom(room,'race:started');
 }
-function handleAction(room,p,d){
- const now=Date.now(); if(now-p.lastAction<250)return; p.lastAction=now;
- if(p.dead||p.finished||p.frozen>0)return;
- const yaw=Number.isFinite(+d.yaw)?+d.yaw:p.yaw;
- if(d.action==='attack'){
-  const damage=CHAR[p.charId].damage;
-  for(const t of room.players.values()){
-   if(t.id===p.id||t.dead||t.finished||t.frozen>0)continue;
-   const dx=t.x-p.x, dd=t.dist-p.dist;
-   const distance=Math.hypot(dx,dd);
-   const facing=(-Math.sin(yaw)*dx+Math.cos(yaw)*dd);
-   if(distance<5.2&&facing>0&&damage>0){
-    t.hp-=damage;t.pushTime=.24;t.pushX=Math.sign(dx||1)*.55;t.pushDist=Math.sign(dd||1)*.35;t.pushSpeed=15;
-    if(t.hp<=0){t.hp=0;t.dead=true;t.respawnAt=now+3000;event(room,{event:'death',targetId:t.id});}
-    else event(room,{event:'bash',targetId:t.id,x:t.x,dist:t.dist});
-   }
-  }
- } else if(d.action==='skill'){
-  if(p.skillCd>0||p.charId===1||p.charId===4)return;
-  const cds=[6,0,5,.5,0,8,6];p.skillCd=cds[p.charId]||6;
-  for(const t of room.players.values()){
-   if(t.id===p.id||t.dead||t.finished)continue;
-   const dx=t.x-p.x,dd=t.dist-p.dist,dist=Math.hypot(dx,dd);
-   if(dist>16)continue;
-   if(p.charId===0){t.confused=3;event(room,{event:'rage',targetId:t.id,x:t.x,dist:t.dist});}
-   if(p.charId===2){ /* applied when the projectile lands */ }
-   if(p.charId===5){t.stun=2;event(room,{event:'royal',targetId:t.id,x:t.x,dist:t.dist});}
-   if(p.charId===6){t.hp=Math.max(0,t.hp-22);t.pushTime=.35;t.pushX=Math.sign(dx||1);t.pushDist=Math.sign(dd||1);if(t.hp===0){t.dead=true;t.respawnAt=now+3000;event(room,{event:'death',targetId:t.id});}}
-  }
-  if(p.charId===2){
-   const yawDirX=-Math.sin(yaw), yawDirDist=Math.cos(yaw);
-   const f=clamp(p.input.forward,-1,1), side=clamp(p.input.side,-1,1), speed=CHAR[p.charId].speed;
-   const runnerVX=(-Math.sin(yaw)*f+Math.cos(yaw)*side)*speed*1.25;
-   const runnerVDist=(Math.cos(yaw)*f+Math.sin(yaw)*side)*speed*2.2;
-   const projectile={x:p.x+yawDirX*.7,dist:p.dist+yawDirDist*.7,y:1.65+p.jumpHeight,
-    vx:yawDirX*24+runnerVX,vDist:yawDirDist*24+runnerVDist,vy:7.2,timer:1.45,ownerId:p.id};
-   room.iceProjectiles.push(projectile);
-   event(room,{event:'ice-throw',x:projectile.x,dist:projectile.dist,y:projectile.y,
-    vx:projectile.vx,vDist:projectile.vDist,vy:projectile.vy,timer:projectile.timer,ownerId:p.id});
-  }
-  if(p.charId===3){
-   if(room.turrets.filter(t=>t.ownerId===p.id).length<5){
-    const t={id:id(),ownerId:p.id,x:p.x,dist:p.dist,hp:30,maxHp:30};room.turrets.push(t);
-    event(room,{event:'turret-place',targetId:p.id,x:p.x,dist:p.dist});
-   }
+function damagePlayer(room, source, target, damage, push={}) {
+ if(!target || target.charId===4 || target.dead || target.finished) return false; // 시민은 싱글플레이와 동일하게 상시 무적
+ target.hp=Math.max(0,target.hp-damage);
+ if(push.time){target.pushTime=push.time;target.pushX=push.x||0;target.pushDist=push.dist||0;target.pushSpeed=push.speed||15;}
+ if(target.hp<=0){target.dead=true;target.respawnAt=Date.now()+3000;event(room,{event:'death',targetId:target.id,ownerId:source?.id});}
+ else event(room,{event:'hit',targetId:target.id,ownerId:source?.id,x:target.x,dist:target.dist,damage});
+ return true;
+}
+function spawnAttackProjectile(room,p,yaw,pitch=0){
+ const c=CHAR[p.charId],cp=Math.cos(pitch),dirX=-Math.sin(yaw)*cp,dirDist=Math.cos(yaw)*cp;
+ const speed=c.projectileSpeed||42;
+ const projectile={id:id(),ownerId:p.id,charId:p.charId,x:p.x+dirX*.8,dist:p.dist+dirDist*.8,
+  y:1.35+p.jumpHeight,vx:dirX*speed,vDist:dirDist*speed,vy:Math.sin(pitch)*speed,timer:1.5,damage:c.damage,kind:'attack'};
+ room.projectiles.push(projectile);
+ event(room,{event:'attack-projectile',ownerId:p.id,charId:p.charId,x:projectile.x,dist:projectile.dist,y:projectile.y,vx:projectile.vx,vDist:projectile.vDist,vy:0,timer:1.5});
+}
+function shieldBash(room,p,yaw,damage=22){
+ const dx=-Math.sin(yaw),dd=Math.cos(yaw),range=4.6,width=2.0;
+ for(const t of room.players.values()){
+  if(t.id===p.id||t.dead||t.finished||t.charId===4)continue;
+  const rx=t.x-p.x,rd=t.dist-p.dist,forward=rx*dx+rd*dd,lateral=Math.abs(rx*dd-rd*dx);
+  if(forward>0.15&&forward<range&&lateral<width){
+   t.frozen=0;
+   damagePlayer(room,p,t,damage,{time:.72,x:dx,dist:dd,speed:15});
+   event(room,{event:'bash',targetId:t.id,ownerId:p.id,x:t.x,dist:t.dist});
   }
  }
 }
+function handleAction(room,p,d){
+ const now=Date.now();
+ if(p.dead||p.finished||p.frozen>0)return;
+ const yaw=Number.isFinite(+d.yaw)?+d.yaw:p.yaw;
+ if(d.action==='attack'){
+  if(now-p.lastAttack<320)return;
+  p.lastAttack=now;
+  if(p.charId===6) shieldBash(room,p,yaw);
+  else spawnAttackProjectile(room,p,yaw,clamp(Number(d.pitch)||0,-.85,.85));
+  return;
+ }
+ if(d.action!=='skill')return;
+ if(p.skillCd>0||p.charId===1||p.charId===4)return;
+ const c=CHAR[p.charId];
+ if(p.charId===3&&room.turrets.filter(t=>t.ownerId===p.id).length>=5)return;
+ p.skillCd=c.skillCd;
+ if(p.charId===0){
+  for(const t of room.players.values()){
+   if(t.id===p.id||t.dead||t.finished||t.charId===4)continue;
+   if(Math.hypot(t.x-p.x,t.dist-p.dist)<=16){t.confused=4;event(room,{event:'rage',targetId:t.id,x:t.x,dist:t.dist,ownerId:p.id});}
+  }
+ }else if(p.charId===2){
+  const pitch=clamp(Number(d.pitch)||0,-.85,.85),cp=Math.cos(pitch),dirX=-Math.sin(yaw)*cp,dirDist=Math.cos(yaw)*cp;
+  // 투척자의 현재 이동 속도를 더해 달리면서 던지면 더 멀리 날아간다.
+  const f=clamp(p.input.forward,-1,1),side=clamp(p.input.side,-1,1),speed=c.speed;
+  const runnerVX=(-Math.sin(yaw)*f+Math.cos(yaw)*side)*speed*1.25;
+  const runnerVDist=(Math.cos(yaw)*f+Math.sin(yaw)*side)*speed*2.2;
+  const g={id:id(),ownerId:p.id,x:p.x+dirX*.7,dist:p.dist+dirDist*.7,y:1.65+p.jumpHeight,
+   vx:dirX*24+runnerVX,vDist:dirDist*24+runnerVDist,vy:6.5+Math.sin(pitch)*24,timer:1.3};
+  room.iceProjectiles.push(g);
+  event(room,{event:'ice-throw',...g});
+ }else if(p.charId===3){
+  const dirX=-Math.sin(yaw),dirDist=Math.cos(yaw);
+  const t={id:id(),ownerId:p.id,x:clamp(p.x+dirX*2.2,-13,13),dist:p.dist+dirDist*2.2,hp:30,maxHp:30,cd:.2};
+  room.turrets.push(t);event(room,{event:'turret-place',targetId:p.id,turret:{...t},x:t.x,dist:t.dist});
+ }else if(p.charId===5){
+  for(const t of room.players.values()){
+   if(t.id===p.id||t.dead||t.finished||t.charId===4)continue;
+   if(Math.abs(t.dist-p.dist)<20){t.stun=2;event(room,{event:'royal',targetId:t.id,x:t.x,dist:t.dist,ownerId:p.id});}
+  }
+ }else if(p.charId===6){shieldBash(room,p,yaw,8);}
+}
+function updateProjectiles(room,dt){
+ for(let i=room.projectiles.length-1;i>=0;i--){
+  const b=room.projectiles[i];b.timer-=dt;b.x+=b.vx*dt;b.dist+=b.vDist*dt;b.y+=b.vy*dt;
+  let hit=false;
+  for(const t of room.players.values()){
+   if(t.id===b.ownerId||t.dead||t.finished)continue;
+   if(Math.hypot(t.x-b.x,t.dist-b.dist)<1.4&&Math.abs(1.1-b.y)<1.5){
+    damagePlayer(room,room.players.get(b.ownerId),t,b.damage);
+    event(room,{event:'shot',targetId:t.id,ownerId:b.ownerId,x:b.x,dist:b.dist,charId:b.charId});hit=true;break;
+   }
+  }
+  if(!hit&&b.kind!=='turret'){
+   for(let ti=room.turrets.length-1;ti>=0;ti--){
+    const tu=room.turrets[ti];
+    if(tu.ownerId===b.ownerId)continue;
+    if(Math.hypot(tu.x-b.x,tu.dist-b.dist)<1.05&&b.y<2.4){
+     tu.hp=Math.max(0,tu.hp-b.damage);hit=true;
+     if(tu.hp<=0){event(room,{event:'turret-destroy',turretId:tu.id,x:tu.x,dist:tu.dist});room.turrets.splice(ti,1);}
+     break;
+    }
+   }
+  }
+  if(hit||b.timer<=0)room.projectiles.splice(i,1);
+ }
+}
+function updateTurrets(room,dt){
+ for(const tu of room.turrets){
+  tu.cd=(tu.cd||0)-dt;
+  let target=null,minD=24;
+  for(const p of room.players.values()){
+   if(p.id===tu.ownerId||p.dead||p.finished)continue;
+   const d=Math.hypot(p.x-tu.x,p.dist-tu.dist);
+   if(d<minD){minD=d;target=p;}
+  }
+  if(target&&tu.cd<=0){
+   tu.cd=.55;const dx=target.x-tu.x,dd=target.dist-tu.dist,len=Math.hypot(dx,dd)||1;
+   room.projectiles.push({id:id(),ownerId:tu.ownerId,charId:3,x:tu.x,y:.9,dist:tu.dist,
+    vx:dx/len*48,vDist:dd/len*48,vy:0,timer:.8,damage:7,kind:'turret'});
+   event(room,{event:'turret-shot',ownerId:tu.ownerId,targetId:target.id,x:tu.x,dist:tu.dist});
+  }
+ }
+}
+function updateIceProjectiles(room,dt){
+ for(let i=room.iceProjectiles.length-1;i>=0;i--){
+  const g=room.iceProjectiles[i];g.timer-=dt;g.vy-=22*dt;g.x+=g.vx*dt;g.dist+=g.vDist*dt;g.y+=g.vy*dt;
+  if(g.y<=.2||g.timer<=0){
+   const zone={id:id(),x:g.x,dist:g.dist,radius:5.5,life:4.5,ownerId:g.ownerId};room.iceZones.push(zone);
+   for(const target of room.players.values()){
+    if(target.id===g.ownerId||target.dead||target.finished||target.charId===4)continue;
+    if(Math.hypot(target.x-g.x,target.dist-g.dist)<=zone.radius){target.frozen=3;event(room,{event:'ice',targetId:target.id,x:target.x,dist:target.dist,ownerId:g.ownerId});}
+   }
+   event(room,{event:'ice-land',x:g.x,dist:g.dist,ownerId:g.ownerId,projectileId:g.id,radius:zone.radius,life:zone.life});
+   room.iceProjectiles.splice(i,1);
+  }
+ }
+ for(let i=room.iceZones.length-1;i>=0;i--){
+  const z=room.iceZones[i];z.life-=dt;
+  for(const target of room.players.values()){
+   if(target.id===z.ownerId||target.dead||target.finished||target.charId===4||target.frozen>0)continue;
+   if(Math.hypot(target.x-z.x,target.dist-z.dist)<=z.radius){target.frozen=3;event(room,{event:'ice',targetId:target.id,x:target.x,dist:target.dist,ownerId:z.ownerId});}
+  }
+  if(z.life<=0)room.iceZones.splice(i,1);
+ }
+}
+
 function updatePlayer(room,p,dt,now){
  if(!p.connected)return;
  if(now-p.lastInput>1000)p.input={forward:0,side:0,yaw:p.yaw,pitch:0,jump:false};
@@ -165,32 +258,15 @@ function updatePlayer(room,p,dt,now){
  if(p.input.jump&&p.jumpHeight<.05){p.jumpVelocity=7;}
  p.jumpVelocity-=18*dt;p.jumpHeight=Math.max(0,p.jumpHeight+p.jumpVelocity*dt);
  if(p.jumpHeight===0)p.jumpVelocity=0;
- if(p.dist>=TRACK_LENGTH){p.dist-=TRACK_LENGTH;p.lap++;p.charId=rand(0,CHAR.length);p.maxHp=CHAR[p.charId].hp;p.hp=p.maxHp;event(room,{event:'lap',targetId:p.id,lap:p.lap});}
- if(p.lap>3){p.finished=true;event(room,{event:'finish',targetId:p.id,nick:p.nick});}
-}
-function updateIceProjectiles(room,dt){
- for(let i=room.iceProjectiles.length-1;i>=0;i--){
-  const g=room.iceProjectiles[i];g.timer-=dt;g.vy-=22*dt;
-  g.x+=g.vx*dt;g.dist=Math.max(0,g.dist+g.vDist*dt);g.y+=g.vy*dt;
-  if(g.y<=.2||g.timer<=0){
-   const radius=5.5;
-   for(const target of room.players.values()){
-    if(target.id===g.ownerId||target.dead||target.finished)continue;
-    if(Math.hypot(target.x-g.x,target.dist-g.dist)<=radius){
-     target.frozen=3;event(room,{event:'ice',targetId:target.id,x:g.x,dist:g.dist});
-    }
-   }
-   event(room,{event:'ice-land',x:g.x,dist:g.dist,ownerId:g.ownerId});
-   room.iceProjectiles.splice(i,1);
-  }
- }
+ if(p.dist>=TRACK_LENGTH){p.dist-=TRACK_LENGTH;p.lap++;p.charId=rand(0,CHAR.length);p.maxHp=CHAR[p.charId].hp;p.hp=p.maxHp;p.skillCd=0;event(room,{event:'lap',targetId:p.id,lap:p.lap,charId:p.charId,maxHp:p.maxHp});}
+ if(p.lap>MAX_LAPS){p.finished=true;event(room,{event:'finish',targetId:p.id,nick:p.nick});}
 }
 function tick(){
  const now=Date.now(),dt=clamp((now-(lastLoopMs||now))/1000,0,.08);lastLoopMs=now;
  for(const room of rooms.values()){
   if(room.phase!=='racing')continue;
   for(const p of room.players.values())updatePlayer(room,p,dt,now);
-  updateIceProjectiles(room,dt);
+  updateIceProjectiles(room,dt);updateProjectiles(room,dt);updateTurrets(room,dt);
   if(!room.winnerId){const winner=[...room.players.values()].find(p=>p.finished);if(winner){room.winnerId=winner.id;room.phase='finished';broadcastRoom(room,'race:finished');}}
  }
 }
@@ -205,7 +281,7 @@ function handle(ws,peer,d){
   if(d.type==='room:quick'){
    if(getRoom(peer))detach(peer);
    let room=[...rooms.values()].find(r=>r.phase==='waiting'&&!r.password&&r.players.size<MAX_PLAYERS);
-   if(!room){const rid=roomCode();room={id:rid,name:'빠른 매치',password:'',phase:'waiting',players:new Map(),turrets:[],iceProjectiles:[],winnerId:null,createdAt:Date.now()};rooms.set(rid,room);}
+   if(!room){const rid=roomCode();room={id:rid,name:'빠른 매치',password:'',phase:'waiting',players:new Map(),turrets:[],iceProjectiles:[],iceZones:[],projectiles:[],winnerId:null,createdAt:Date.now()};rooms.set(rid,room);}
    const result=enterRoom(peer,room,d.nick);reply(ws,d.requestId,true,result);return;
   }
   const room=getRoom(peer),p=room?.players.get(peer.playerId);
